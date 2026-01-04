@@ -1,112 +1,86 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const bcrypt = require('bcrypt');
+const bodyParser = require('body-parser');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
+const bcrypt = require('bcryptjs');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
 
-const users = {}; // TEMP memory store
+// File to store users permanently
+const USERS_FILE = path.join(__dirname, 'users.json');
 
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
-});
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
 
-function generateCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+// Helper: load users
+function loadUsers() {
+  if (!fs.existsSync(USERS_FILE)) return {};
+  const data = fs.readFileSync(USERS_FILE);
+  return JSON.parse(data);
 }
 
-function auth(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token' });
-
-  try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: 'Invalid token' });
-  }
+// Helper: save users
+function saveUsers(users) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
 }
 
+// ------------------ SIGNUP ------------------
 app.post('/signup', async (req, res) => {
   const { username, email, password } = req.body;
-  if (users[email]) return res.status(400).json({ error: 'User exists' });
-
-  const hash = await bcrypt.hash(password, 10);
-  const code = generateCode();
-
-  users[email] = {
-    username,
-    email,
-    password: hash,
-    verified: false,
-    code,
-    paid: false
-  };
-
-  await transporter.sendMail({
-    to: email,
-    subject: 'TRXTRNATION Verification Code',
-    text: `Your verification code is: ${code}`
-  });
-
-  res.json({ success: true });
-});
-
-app.post('/verify', (req, res) => {
-  const { email, code } = req.body;
-  const user = users[email];
-  if (!user || user.code !== code) {
-    return res.status(400).json({ error: 'Invalid code' });
+  if (!username || !email || !password) {
+    return res.status(400).json({ error: 'All fields are required' });
   }
 
-  user.verified = true;
-  delete user.code;
-  res.json({ success: true });
+  const users = loadUsers();
+  if (users[email]) return res.status(400).json({ error: 'User already exists' });
+
+  const hashed = await bcrypt.hash(password, 10);
+  users[email] = { username, email, password: hashed };
+  saveUsers(users);
+
+  const token = jwt.sign({ email }, JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token, username });
 });
 
+// ------------------ LOGIN ------------------
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'All fields are required' });
+
+  const users = loadUsers();
   const user = users[email];
-  if (!user || !user.verified) {
-    return res.status(400).json({ error: 'Invalid login' });
-  }
+  if (!user) return res.status(400).json({ error: 'Invalid login' });
 
   const match = await bcrypt.compare(password, user.password);
   if (!match) return res.status(400).json({ error: 'Invalid login' });
 
-  const token = jwt.sign(
-    { email },
-    process.env.JWT_SECRET,
-    { expiresIn: '7d' }
-  );
-
-  res.json({
-    token,
-    username: user.username,
-    paid: user.paid
-  });
+  const token = jwt.sign({ email }, JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token, username: user.username });
 });
 
-app.get('/check', auth, (req, res) => {
-  const user = users[req.user.email];
-  res.json({
-    username: user.username,
-    paid: user.paid
-  });
+// ------------------ CHECK TOKEN ------------------
+app.get('/check', (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'No token provided' });
+
+  const token = auth.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const users = loadUsers();
+    const user = users[decoded.email];
+    if (!user) return res.status(401).json({ error: 'Invalid token' });
+    res.json({ ok: true, username: user.username });
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
 });
 
-app.post('/pay', auth, (req, res) => {
-  users[req.user.email].paid = true;
-  res.json({ success: true });
+// ------------------ START SERVER ------------------
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Backend running'));
